@@ -1,1 +1,1 @@
-为[minetest-wasm](https://github.com/paradust7/minetest-wasm)准备的代理。
+A patch for the Luanti 5.16.1 server, as well as proxies written in C++ and TypeScript. This is intended for the [minetest-wasm](https://github.com/paradust7/minetest-wasm) client and provides native support for the Luanti server.
