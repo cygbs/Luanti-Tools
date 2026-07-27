@@ -15,15 +15,19 @@ Description:
     from the same IP work correctly, each gets a unique MTP peer)
   - Fake DNS resolver (returns ws_dns_ip for all lookups)
   - Graceful shutdown (Loop::defer + join, no detach/UAF)
+  - Send-queue UAF fix (clean g_outgoing in onWsClose)
+  - Immediate drain via us_wakeup_loop (sub-ms send latency)
 
   Applies to:  Luanti 5.16.1 (tag: 5ebd9b5)
   Repository:  https://github.com/luanti-org/luanti
-  Based on 5 squashed commits:
+  Based on 7 commits:
+    404bd22 feat: embed WebSocket proxy (uWebSockets) for minetest-wasm browser clients
+    60000eb ws_proxy: shared-queue direct injection (no UDP loopback)
+    8e5ee0a ws_proxy: handle IPv6 X-Forwarded-For addresses
+    358046a ws_proxy: virtual ports for multi-client same-IP support
     3704ee5 ws_proxy: fix stop() — use Loop::defer()+join() instead of detach()
-358046a ws_proxy: virtual ports for multi-client same-IP support
-8e5ee0a ws_proxy: handle IPv6 X-Forwarded-For addresses
-60000eb ws_proxy: shared-queue direct injection (no UDP loopback)
-404bd22 feat: embed WebSocket proxy (uWebSockets) for minetest-wasm browser clients
+    b48f5bd ws_proxy: fix UAF — clean g_outgoing queue in onWsClose
+    596e00d ws_proxy: add us_wakeup_loop for immediate drain, reduce timer overhead
 
 Usage — apply the patch:
   git clone https://github.com/luanti-org/luanti
@@ -65,16 +69,16 @@ Proxy setup (Nginx example for WSS termination):
       proxy_send_timeout 86400s;
   }
 
-Files changed (9 files, +596/-8):
-  src/CMakeLists.txt          — uSockets static lib + ws_proxy.cpp target
-  src/defaultsettings.cpp     — ws_port/ws_bind_address/ws_dns_ip defaults
-  src/network/mtp/impl.h      — WsProxy forward-declare + setWsProxy/getWsProxy
-  src/network/mtp/threads.cpp — WS inject in receive(), WS route in rawSend()
-  src/network/socket.h        — getFamily() for IPv6 check
-  src/network/ws_proxy.cpp    — µWS event loop, queues, PROXY handshake (NEW)
-  src/network/ws_proxy.h      — WsProxy class interface (NEW)
-  src/server.cpp              — start/stop WsProxy in Server::start()
-  src/server.h                — WsProxy unique_ptr member
+Files changed ( 9 files changed, 630 insertions(+), 8 deletions(-)):
+  src/CMakeLists.txt             — uSockets static lib + ws_proxy.cpp target
+  src/defaultsettings.cpp        — ws_port/ws_bind_address/ws_dns_ip defaults
+  src/network/mtp/impl.h         — WsProxy forward-declare + setWsProxy/getWsProxy
+  src/network/mtp/threads.cpp    — WS inject in receive(), WS route in rawSend()
+  src/network/socket.h           — getFamily() for IPv6 check
+  src/network/ws_proxy.cpp       — µWS event loop, queues, PROXY handshake (NEW)
+  src/network/ws_proxy.h         — WsProxy class interface (NEW)
+  src/server.cpp                 — start/stop WsProxy in Server::start()
+  src/server.h                   — WsProxy unique_ptr member
 
 ---
 
@@ -276,10 +280,10 @@ index f56a6e1..b84dfad 100644
  	int m_handle = -1;
 diff --git a/src/network/ws_proxy.cpp b/src/network/ws_proxy.cpp
 new file mode 100644
-index 0000000..8ec480e
+index 0000000..b361fe1
 --- /dev/null
 +++ b/src/network/ws_proxy.cpp
-@@ -0,0 +1,398 @@
+@@ -0,0 +1,432 @@
 +// Luanti WebSocket Proxy — embedded WS→MTP bridge for browser (minetest-wasm) clients.
 +// Based on minetest-wasm-proxy-cpp, adapted to run inside Luanti's process.
 +// SPDX-License-Identifier: LGPL-2.1-or-later
@@ -298,6 +302,7 @@ index 0000000..8ec480e
 +#include <atomic>
 +#include <memory>
 +#include <vector>
++#include <algorithm>
 +
 +/* ── Per-socket session data ──────────────────────────────────── */
 +
@@ -323,6 +328,11 @@ index 0000000..8ec480e
 +};
 +static std::mutex g_outgoing_mutex;
 +static std::vector<OutgoingPacket> g_outgoing;
++
++// Set by trySendWs when data is enqueued; cleared by drain_outgoing.
++// Lets the timer short-circuit when the queue is empty, and enables
++// us_wakeup_loop to trigger immediate drain on the µWS thread.
++static std::atomic<bool> g_drain_pending{false};
 +
 +// Owned pointer to the µWS App — used by stop() to call app->close()
 +// from the event-loop thread via Loop::defer().
@@ -379,12 +389,17 @@ index 0000000..8ec480e
 +/* ── Outgoing drain timer ─────────────────────────────────────── */
 +
 +static void drain_outgoing(us_timer_t *) {
++	// Fast path: no data enqueued since last drain — skip the mutex.
++	if (!g_drain_pending.load(std::memory_order_acquire))
++		return;
++
 +	std::lock_guard<std::mutex> lk(g_outgoing_mutex);
 +	for (auto &p : g_outgoing) {
 +		p.ws->send(std::string_view(p.data),
 +		           uWS::OpCode::BINARY);
 +	}
 +	g_outgoing.clear();
++	g_drain_pending.store(false, std::memory_order_release);
 +}
 +
 +/* ── Event loop thread function ───────────────────────────────── */
@@ -644,7 +659,23 @@ index 0000000..8ec480e
 +{
 +	std::lock_guard<std::mutex> lk(m_ws_mutex);
 +	std::string key = real_ip + ":" + std::to_string(port);
-+	m_ws_by_key.erase(key);
++	auto it = m_ws_by_key.find(key);
++	if (it != m_ws_by_key.end()) {
++		void *ws_raw = it->second;
++		m_ws_by_key.erase(it);
++
++		// Clean outgoing queue of any pending packets for this
++		// WebSocket — the µWS event loop may destroy the ws object
++		// after this callback returns, and drain_outgoing must
++		// never call ws->send() on a freed pointer.
++		std::lock_guard<std::mutex> lk_out(g_outgoing_mutex);
++		g_outgoing.erase(
++			std::remove_if(g_outgoing.begin(), g_outgoing.end(),
++				[ws_raw](const OutgoingPacket &p) {
++					return p.ws == ws_raw;
++				}),
++			g_outgoing.end());
++	}
 +}
 +
 +static std::string makeSendKey(const Address &addr) {
@@ -676,6 +707,13 @@ index 0000000..8ec480e
 +		g_outgoing.push_back({ws, std::string((const char *)data,
 +		                                      (size_t)size)});
 +	}
++
++	// Wake the µWS event loop so drain_outgoing fires immediately
++	// instead of waiting for the next 1ms timer tick.
++	g_drain_pending.store(true, std::memory_order_release);
++	if (auto *l = g_loop.load(std::memory_order_acquire))
++		us_wakeup_loop(reinterpret_cast<struct us_loop_t *>(l));
++
 +	return true;
 +}
 diff --git a/src/network/ws_proxy.h b/src/network/ws_proxy.h
