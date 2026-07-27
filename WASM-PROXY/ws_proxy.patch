@@ -1,50 +1,83 @@
-From: Luanti WS Proxy Patch Set
-Subject: Embed WebSocket proxy for minetest-wasm browser client support
+From: Ygbs <h@ypixel.net>
+Subject: Embedded WebSocket Proxy for minetest-wasm browser clients
+
 Description:
-  This patch adds an embedded WebSocket proxy (uWebSockets) to the Luanti
-  server, enabling browser-based minetest-wasm clients to connect and play.
-  It includes shared-queue direct MTP injection (no UDP loopback) and
-  proper IPv6 X-Forwarded-For address handling.
+  Adds an embedded µWS WebSocket proxy server to Luanti, allowing
+  minetest-wasm browser clients to connect via WebSocket instead of
+  raw UDP.  The proxy injects raw MTP packets into the existing
+  ConnectionReceiveThread via a shared queue — no UDP loopback,
+  no MTP protocol modification.
 
-  Applies to: Luanti 5.16.1 (tag: 5ebd9b5)
-  Repository: https://github.com/luanti-org/luanti
-  Based on 3 squashed commits:
-    404bd22 feat: embed WebSocket proxy (uWebSockets) for minetest-wasm clients
-    60000eb ws_proxy: shared-queue direct injection (no UDP loopback)
-    8e5ee0a ws_proxy: handle IPv6 X-Forwarded-For addresses
+  Features:
+  - X-Forwarded-For real IP extraction (Cloudflare/Nginx compatible)
+  - IPv6 support (IPv4-mapped ::ffff: addresses handled correctly)
+  - Virtual port assignment per WS session (multiple browser tabs
+    from the same IP work correctly, each gets a unique MTP peer)
+  - Fake DNS resolver (returns ws_dns_ip for all lookups)
+  - Graceful shutdown (Loop::defer + join, no detach/UAF)
 
-Usage:
+  Applies to:  Luanti 5.16.1 (tag: 5ebd9b5)
+  Repository:  https://github.com/luanti-org/luanti
+  Based on 5 squashed commits:
+    3704ee5 ws_proxy: fix stop() — use Loop::defer()+join() instead of detach()
+358046a ws_proxy: virtual ports for multi-client same-IP support
+8e5ee0a ws_proxy: handle IPv6 X-Forwarded-For addresses
+60000eb ws_proxy: shared-queue direct injection (no UDP loopback)
+404bd22 feat: embed WebSocket proxy (uWebSockets) for minetest-wasm browser clients
+
+Usage — apply the patch:
   git clone https://github.com/luanti-org/luanti
   cd luanti
   git checkout 5.16.1
+
+  # Clone uWebSockets next to the luanti source tree
+  git clone --depth 1 https://github.com/uNetworking/uWebSockets.git ../uWebSockets
+
   git apply /path/to/ws_proxy.patch
 
-  Or apply on a detached HEAD at the tag:
-  git checkout 5ebd9b5
-  git apply /path/to/ws_proxy.patch
-
-Files changed (9 files, +486/-8):
-  src/CMakeLists.txt          |  29 +++++
-  src/defaultsettings.cpp     |   5 +
-  src/network/mtp/impl.h      |   7 +
-  src/network/mtp/threads.cpp |  56 ++++++--
-  src/network/socket.h        |   1 +
-  src/network/ws_proxy.cpp    | 310 ++++++++++++++++++++++++++++++++++++
-  src/network/ws_proxy.h      |  55 ++++++++
-  src/server.cpp              |  26 ++++
-  src/server.h                |   5 +
-
-Build:
+Build — server only:
   mkdir build && cd build
-  cmake .. -DBUILD_SERVER=ON -DBUILD_CLIENT=OFF
+  cmake .. -DBUILD_SERVER=ON -DBUILD_CLIENT=OFF -DCMAKE_BUILD_TYPE=Release
+  make -j$(nproc)
+  # Binary: bin/luantiserver
+
+Build — with LuaJIT (recommended for VoxeLibre):
+  cmake .. -DBUILD_SERVER=ON -DBUILD_CLIENT=OFF -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_LUAJIT=ON
   make -j$(nproc)
 
-Configuration (luanti.conf):
-  ws_port = 8888
-  ws_bind_address = 127.0.0.1
-  ws_dns_ip = 1.1.1.1
+Configuration (minetest.conf):
+  ws_port = 8888          # 0 = disable WebSocket proxy
+  ws_bind_address =        # empty = 0.0.0.0 (bind all interfaces)
+  ws_dns_ip = 1.1.1.1     # fake DNS response for browser client
+
+  # Optional: reduce packet-quota log noise during initial world sync
+  max_packets_per_iteration = 4096
+
+Proxy setup (Nginx example for WSS termination):
+  location /mtproxy {
+      proxy_pass http://127.0.0.1:8888;
+      proxy_http_version 1.1;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_read_timeout 86400s;
+      proxy_send_timeout 86400s;
+  }
+
+Files changed (9 files, +596/-8):
+  src/CMakeLists.txt          — uSockets static lib + ws_proxy.cpp target
+  src/defaultsettings.cpp     — ws_port/ws_bind_address/ws_dns_ip defaults
+  src/network/mtp/impl.h      — WsProxy forward-declare + setWsProxy/getWsProxy
+  src/network/mtp/threads.cpp — WS inject in receive(), WS route in rawSend()
+  src/network/socket.h        — getFamily() for IPv6 check
+  src/network/ws_proxy.cpp    — µWS event loop, queues, PROXY handshake (NEW)
+  src/network/ws_proxy.h      — WsProxy class interface (NEW)
+  src/server.cpp              — start/stop WsProxy in Server::start()
+  src/server.h                — WsProxy unique_ptr member
 
 ---
+
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
 index 7ade366..5800af5 100644
 --- a/src/CMakeLists.txt
@@ -141,7 +174,7 @@ index 91dceb8..14546f9 100644
  
  } // namespace
 diff --git a/src/network/mtp/threads.cpp b/src/network/mtp/threads.cpp
-index 60bcfbf..a51fd1b 100644
+index 60bcfbf..ecb61c1 100644
 --- a/src/network/mtp/threads.cpp
 +++ b/src/network/mtp/threads.cpp
 @@ -9,7 +9,9 @@
@@ -170,7 +203,7 @@ index 60bcfbf..a51fd1b 100644
  	} catch (SendFailedException &e) {
  		LOG(derr_con << m_connection->getDesc()
  			<< "SendFailedException: " << e.what() << " to "
-@@ -959,15 +963,51 @@ void ConnectionReceiveThread::receive(SharedBuffer<u8> &packetdata,
+@@ -959,15 +963,53 @@ void ConnectionReceiveThread::receive(SharedBuffer<u8> &packetdata,
  				}
  			}
  			packet_queued = false;
@@ -188,7 +221,8 @@ index 60bcfbf..a51fd1b 100644
 +			WsProxy *wp = m_connection->getWsProxy();
 +			if (wp) {
 +				std::string ws_data, ws_ip;
-+				if (wp->tryPopPacket(ws_data, ws_ip)) {
++				uint16_t ws_port = 0;
++				if (wp->tryPopPacket(ws_data, ws_ip, ws_port)) {
 +					try {
 +						// X-Forwarded-For may be IPv4 or IPv6.
 +						// IPv4 + IPv6 socket → ::ffff:<ip>
@@ -201,6 +235,7 @@ index 60bcfbf..a51fd1b 100644
 +								("::ffff:" + ws_ip).c_str());
 +						else
 +							sender.Resolve(ws_ip.c_str());
++						sender.setPort(ws_port);
 +					} catch (ResolveError &) {
 +						goto udp_recv;
 +					}
@@ -241,10 +276,10 @@ index f56a6e1..b84dfad 100644
  	int m_handle = -1;
 diff --git a/src/network/ws_proxy.cpp b/src/network/ws_proxy.cpp
 new file mode 100644
-index 0000000..e46ca5f
+index 0000000..8ec480e
 --- /dev/null
 +++ b/src/network/ws_proxy.cpp
-@@ -0,0 +1,310 @@
+@@ -0,0 +1,398 @@
 +// Luanti WebSocket Proxy — embedded WS→MTP bridge for browser (minetest-wasm) clients.
 +// Based on minetest-wasm-proxy-cpp, adapted to run inside Luanti's process.
 +// SPDX-License-Identifier: LGPL-2.1-or-later
@@ -260,6 +295,8 @@ index 0000000..e46ca5f
 +#include <string_view>
 +#include <regex>
 +#include <cstring>
++#include <atomic>
++#include <memory>
 +#include <vector>
 +
 +/* ── Per-socket session data ──────────────────────────────────── */
@@ -269,6 +306,7 @@ index 0000000..e46ca5f
 +struct WsSession {
 +	WsState state = WsState::HANDSHAKE;
 +	std::string real_ip;
++	uint16_t virtual_port = 0; // unique per-session, assigned at upgrade
 +};
 +
 +/* ── Globals ──────────────────────────────────────────────────── */
@@ -285,6 +323,13 @@ index 0000000..e46ca5f
 +};
 +static std::mutex g_outgoing_mutex;
 +static std::vector<OutgoingPacket> g_outgoing;
++
++// Owned pointer to the µWS App — used by stop() to call app->close()
++// from the event-loop thread via Loop::defer().
++static std::shared_ptr<uWS::TemplatedApp<false>> g_app_ptr;
++// Atomic: set/release in ws_thread_func, load/acquire in stop().
++// g_app_ptr is always valid when g_loop is non-null.
++static std::atomic<uWS::Loop *> g_loop{nullptr};
 +
 +/* ── PROXY protocol handler ───────────────────────────────────── */
 +
@@ -364,13 +409,21 @@ index 0000000..e46ca5f
 +				real_ip = (comma != std::string_view::npos)
 +					? std::string(xff.substr(0, comma))
 +					: std::string(xff);
++				// Trim leading whitespace
 +				auto start = real_ip.find_first_not_of(" \t");
 +				if (start == std::string::npos) start = 0;
 +				real_ip = real_ip.substr(start);
++				// Trim trailing whitespace
++				auto end = real_ip.find_last_not_of(" \t");
++				if (end != std::string::npos)
++					real_ip = real_ip.substr(0, end + 1);
 +			}
 +
 +			WsSession sd;
 +			sd.real_ip = real_ip;
++			// Assign a unique virtual port now so the open
++			// callback can register with the composite key.
++			sd.virtual_port = g_proxy ? g_proxy->nextPort() : 0;
 +
 +			res->template upgrade<WsSession>(
 +				std::move(sd),
@@ -388,8 +441,10 @@ index 0000000..e46ca5f
 +				sess->real_ip = std::string(
 +					ws->getRemoteAddressAsText());
 +			if (g_proxy)
-+				g_proxy->onWsOpen(sess->real_ip, ws);
++				g_proxy->onWsOpen(sess->real_ip,
++				                  sess->virtual_port, ws);
 +			infostream << "WS: [" << sess->real_ip
++			           << ":" << sess->virtual_port
 +			           << "] connected" << std::endl;
 +		},
 +
@@ -410,7 +465,9 @@ index 0000000..e46ca5f
 +
 +			if (sess->state == WsState::RELAY) {
 +				if (g_proxy)
-+					g_proxy->injectPacket(message, sess->real_ip);
++					g_proxy->injectPacket(message,
++						sess->real_ip,
++						sess->virtual_port);
 +				return;
 +			}
 +
@@ -442,8 +499,10 @@ index 0000000..e46ca5f
 +		.close = [](auto *ws, int, std::string_view) {
 +			auto *sess = ws->getUserData();
 +			if (g_proxy)
-+				g_proxy->onWsClose(sess->real_ip);
++				g_proxy->onWsClose(sess->real_ip,
++				                   sess->virtual_port);
 +			infostream << "WS: [" << sess->real_ip
++			           << ":" << sess->virtual_port
 +			           << "] disconnected" << std::endl;
 +			sess->state = WsState::DEAD;
 +		}
@@ -472,7 +531,16 @@ index 0000000..e46ca5f
 +		us_create_timer(us_loop, 1, 0);
 +	us_timer_set(out_timer, drain_outgoing, 1, 1);
 +
-+	app.run();
++	// Move App into a shared_ptr so stop() can call app->close()
++	// via Loop::defer() from any thread.
++	g_app_ptr = std::make_shared<uWS::TemplatedApp<false>>(
++		std::move(app));
++	g_loop.store(g_app_ptr->getLoop(), std::memory_order_release);
++	g_app_ptr->run();
++
++	// Thread is shutting down — clear globals so stop() knows.
++	g_loop.store(nullptr, std::memory_order_release);
++	g_app_ptr.reset();
 +}
 +
 +/* ── WsProxy class methods ────────────────────────────────────── */
@@ -498,39 +566,88 @@ index 0000000..e46ca5f
 +}
 +
 +void WsProxy::stop() {
++	// Prevent double-stop (m_running acts as a one-shot gate).
 +	if (!m_running.exchange(false))
 +		return;
++
++	// CRITICAL: null g_proxy BEFORE waking the event loop.  This ensures
++	// that any in-flight or deferred callbacks that check g_proxy will
++	// no-op instead of dereferencing a destroyed WsProxy.
++	g_proxy = nullptr;
++
++	// Tell the µWS event loop to shut down.  app->close() closes all
++	// listen sockets and WS connections from the correct thread, causing
++	// app->run() to return and ws_thread_func to exit.
++	{
++		uWS::Loop *loop = g_loop.load(std::memory_order_acquire);
++		if (loop) {
++			auto app = g_app_ptr;   // keep a ref across the defer
++			loop->defer([app]() {
++				app->close();
++			});
++		}
++	}
++
++	// Wait for the event-loop thread to finish.
 +	if (m_thread.joinable())
-+		m_thread.detach();
++		m_thread.join();
++
++	g_loop.store(nullptr, std::memory_order_release);
++	g_app_ptr.reset();
 +}
 +
-+void WsProxy::injectPacket(std::string_view data, const std::string &real_ip) {
++uint16_t WsProxy::nextPort() {
++	// Called only from µWS upgrade callback (single thread).
++	uint16_t port = m_next_port.fetch_add(1);
++	// Wrap back to 50000 on overflow; stale ports are already
++	// erased from m_ws_by_key via onWsClose.
++	if (port < 50000) {
++		m_next_port.store(50001);
++		return 50000;
++	}
++	return port;
++}
++
++void WsProxy::injectPacket(std::string_view data,
++                           const std::string &real_ip,
++                           uint16_t virtual_port)
++{
 +	std::lock_guard<std::mutex> lk(m_queue_mutex);
-+	m_packet_queue.emplace(std::string(data), real_ip);
++	m_packet_queue.push({std::string(data), real_ip, virtual_port});
 +}
 +
-+bool WsProxy::tryPopPacket(std::string &out_data, std::string &out_real_ip) {
++bool WsProxy::tryPopPacket(std::string &out_data,
++                           std::string &out_ip,
++                           uint16_t &out_port)
++{
 +	std::lock_guard<std::mutex> lk(m_queue_mutex);
 +	if (m_packet_queue.empty())
 +		return false;
 +	auto &front = m_packet_queue.front();
-+	out_data = std::move(front.first);
-+	out_real_ip = std::move(front.second);
++	out_data = std::move(front.data);
++	out_ip = std::move(front.ip);
++	out_port = front.port;
 +	m_packet_queue.pop();
 +	return true;
 +}
 +
-+void WsProxy::onWsOpen(const std::string &real_ip, void *ws) {
++void WsProxy::onWsOpen(const std::string &real_ip,
++                       uint16_t port, void *ws)
++{
 +	std::lock_guard<std::mutex> lk(m_ws_mutex);
-+	m_ws_by_ip[real_ip] = ws;
++	std::string key = real_ip + ":" + std::to_string(port);
++	m_ws_by_key[key] = ws;
 +}
 +
-+void WsProxy::onWsClose(const std::string &real_ip) {
++void WsProxy::onWsClose(const std::string &real_ip,
++                        uint16_t port)
++{
 +	std::lock_guard<std::mutex> lk(m_ws_mutex);
-+	m_ws_by_ip.erase(real_ip);
++	std::string key = real_ip + ":" + std::to_string(port);
++	m_ws_by_key.erase(key);
 +}
 +
-+bool WsProxy::trySendWs(const Address &addr, const void *data, int size) {
++static std::string makeSendKey(const Address &addr) {
 +	std::string ip = addr.serializeString();
 +	// Strip IPv4-mapped IPv6 prefix only when the remainder
 +	// is a plain IPv4 address (::ffff:1.2.3.4 → 1.2.3.4).
@@ -538,10 +655,16 @@ index 0000000..e46ca5f
 +	const char *pfx = "::ffff:";
 +	if (ip.compare(0, 7, pfx) == 0 && ip.find(':', 7) == std::string::npos)
 +		ip.erase(0, 7);
++	// Append virtual port for composite key (IP:port).
++	return ip + ":" + std::to_string(addr.getPort());
++}
++
++bool WsProxy::trySendWs(const Address &addr, const void *data, int size) {
++	std::string key = makeSendKey(addr);
 +
 +	std::lock_guard<std::mutex> lk(m_ws_mutex);
-+	auto it = m_ws_by_ip.find(ip);
-+	if (it == m_ws_by_ip.end())
++	auto it = m_ws_by_key.find(key);
++	if (it == m_ws_by_key.end())
 +		return false;
 +
 +	// Queue for the µWS event loop to drain (ws->send() is NOT
@@ -557,10 +680,10 @@ index 0000000..e46ca5f
 +}
 diff --git a/src/network/ws_proxy.h b/src/network/ws_proxy.h
 new file mode 100644
-index 0000000..4d54d90
+index 0000000..795286d
 --- /dev/null
 +++ b/src/network/ws_proxy.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,75 @@
 +// Luanti WebSocket Proxy — embedded WS→MTP bridge for browser (minetest-wasm) clients.
 +// SPDX-License-Identifier: LGPL-2.1-or-later
 +#pragma once
@@ -572,6 +695,7 @@ index 0000000..4d54d90
 +#include <mutex>
 +#include <queue>
 +#include <unordered_map>
++#include <cstdint>
 +
 +class Address;
 +
@@ -588,33 +712,52 @@ index 0000000..4d54d90
 +	bool isRunning() const { return m_running.load(); }
 +
 +	// ── Receive path: µWS → MTP ──────────────────────────────────
-+	void injectPacket(std::string_view data, const std::string &real_ip);
-+	bool tryPopPacket(std::string &out_data, std::string &out_real_ip);
++	// Each WS session gets a unique virtual port so that MTP can
++	// distinguish multiple clients from the same IP address.
++	void injectPacket(std::string_view data, const std::string &real_ip,
++	                  uint16_t virtual_port);
++	bool tryPopPacket(std::string &out_data, std::string &out_ip,
++	                  uint16_t &out_port);
 +
 +	// ── Send path: MTP → µWS ────────────────────────────────────
 +	// Called from µWS .open/.close to register WS connections by
-+	// their real (X-Forwarded-For) IP address.
-+	void onWsOpen(const std::string &real_ip, void *ws);
-+	void onWsClose(const std::string &real_ip);
++	// their real (X-Forwarded-For) IP + virtual port composite key.
++	void onWsOpen(const std::string &real_ip, uint16_t port, void *ws);
++	void onWsClose(const std::string &real_ip, uint16_t port);
 +
 +	// Called from ConnectionSendThread::rawSend().  Returns true
 +	// if the destination address belongs to a WS peer (sent via
 +	// WebSocket), false if it should fall through to UDP.
 +	bool trySendWs(const Address &addr, const void *data, int size);
 +
++	// Allocate a unique virtual port for a new WS session.
++	// Called from µWS upgrade/thread only; not thread-safe.
++	uint16_t nextPort();
++
 +private:
 +	std::thread m_thread;
 +	std::atomic<bool> m_running{false};
 +
-+	// Receive queue
++	// Virtual port counter starts at 50000 (above any real UDP port,
++	// well within u16 range).  Wraps back to 50000 on overflow.
++	std::atomic<uint16_t> m_next_port{50000};
++
++	// Receive queue entry (data + sender IP + virtual port).
++	struct RecvPacket {
++		std::string data;
++		std::string ip;
++		uint16_t port;
++	};
++
++	// Receive queue (µWS .message pushes, MTP receive thread pops).
 +	std::mutex m_queue_mutex;
-+	std::queue<std::pair<std::string, std::string>> m_packet_queue;
++	std::queue<RecvPacket> m_packet_queue;
 +
 +	// Register/deregister are called from µWS thread; trySendWs is
-+	// called from MTP send thread; both touch m_ws_by_ip.
++	// called from MTP send thread; both touch m_ws_by_key.
 +	std::mutex m_ws_mutex;
-+	// opaque pointer to uWS::WebSocket<false,true,WsSession>
-+	std::unordered_map<std::string, void *> m_ws_by_ip;
++	// Key: "IP:virtual_port" → opaque uWS::WebSocket<…>
++	std::unordered_map<std::string, void *> m_ws_by_key;
 +};
 diff --git a/src/server.cpp b/src/server.cpp
 index 36133d1..74aa474 100644
